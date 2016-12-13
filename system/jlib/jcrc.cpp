@@ -115,7 +115,74 @@ const static unsigned crc_32_tab[] = { /* CRC polynomial 0xedb88320 */
 
 #define UPDC32(octet, crc) (crc_32_tab[((crc) ^ (octet)) & 0xff] ^ ((crc) >> 8))
 
-#ifdef _USE_OLD_CRC32
+// #ifdef _USE_OLD_CRC32
+
+//JT Magic
+#define CRC_TABLE
+#include "crc32_constants.h"
+
+#define VMX_ALIGN	16
+#define VMX_ALIGN_MASK	(VMX_ALIGN-1)
+
+#ifdef REFLECT
+unsigned crc32_align(unsigned crc, const char *p, unsigned len)
+{
+	while (len--)
+		crc = crc_table[(crc ^ *p++) & 0xff] ^ (crc >> 8);
+	return crc;
+}
+#else
+unsigned crc32_align(unsigned crc, const char *p, unsigned len)
+{
+	while (len--)
+		crc = crc_table[((crc >> 24) ^ *p++) & 0xff] ^ (crc << 8);
+	return crc;
+}
+#endif
+
+//unsigned __crc32(const char *buf, unsigned len, unsigned crc);
+//  Hmm
+unsigned __crc32_vpmsum(unsigned crc, const char *p, unsigned len);
+
+
+//unsigned int crc32_vpmsum(unsigned int crc, unsigned char *p,
+unsigned crc32(const char *buf, unsigned len, unsigned crc)
+{
+	unsigned int prealign;
+	unsigned int tail;
+
+#ifdef CRC_XOR
+	crc ^= 0xffffffff;
+#endif
+	if (len < VMX_ALIGN + VMX_ALIGN_MASK) {
+		crc = crc32_align(crc, buf, len);
+		goto out;
+	}
+	if ((unsigned long)buf & VMX_ALIGN_MASK) {
+		prealign = VMX_ALIGN - ((unsigned long)buf & VMX_ALIGN_MASK);
+		crc = crc32_align(crc, buf, prealign);
+		len -= prealign;
+		buf += prealign;
+	}
+
+	crc = __crc32_vpmsum(crc, buf, len & ~VMX_ALIGN_MASK);
+
+
+	tail = len & VMX_ALIGN_MASK;
+	if (tail) {
+		buf += len & ~VMX_ALIGN_MASK;
+		crc = crc32_align(crc, buf, tail);
+	}
+
+out:
+#ifdef CRC_XOR
+	crc ^= 0xffffffff;
+#endif
+
+	return crc;
+}
+/* JT Swill
+ 
 unsigned crc32(const char *buf, unsigned len, unsigned crc)
 {
     unsigned char    c;
@@ -145,6 +212,7 @@ unsigned crc32(const char *buf, unsigned len, unsigned crc)
 
     return(crc);
 }
+
 
 #else // _USE_OLD_CRC32
 
@@ -503,6 +571,8 @@ uint32_t crc32(const char *data, uint32_t length, uint32_t previousCrc32 = 0)
 /////////////////////////////////////////////////////////////
 #endif // _USE_OLD_CRC32
 
+*/  // JT Swill
+
 #define UPDC32_0(crc) (crc_32_tab[(crc) & 0xff] ^ ((crc) >> 8))
 
 unsigned combineCrc32(unsigned crc1, unsigned numBytes, unsigned crc2)
@@ -663,6 +733,8 @@ unsigned CRC32info::tally(size32_t len, const void * data, unsigned crc)
 
 static CRC32info crc32info(0xedb88320);
 
+
+
 //---------------------------------------------------------------------------
 
 void CRC32::skip(offset_t length)
@@ -674,7 +746,6 @@ void CRC32::tally(unsigned len, const void * buf)
 {
     crc = crc32((const char *)buf, len, crc);
 }
-
 //---------------------------------------------------------------------------
 
 CRC32Merger::CRC32Merger() 
@@ -694,7 +765,6 @@ void CRC32Merger::clear()
 {
     crc = ~0;
 }
-
 //---------------------------------------------------------------------------
 
 // A faster alternative to a CRC - word at a time, and no table lookup.

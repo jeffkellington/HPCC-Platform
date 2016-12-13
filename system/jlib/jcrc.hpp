@@ -29,6 +29,7 @@
 
 
 jlib_decl unsigned crc32(const char *buf, unsigned len, unsigned crc);
+extern "C" jlib_decl unsigned __crc32_vpmsum(unsigned crc, const char *p, unsigned len);
 jlib_decl unsigned cxc32(unsigned * buf, unsigned numWords, unsigned cxc32);
 jlib_decl unsigned short crc16(const void *buf,size32_t len,unsigned short crc);
 

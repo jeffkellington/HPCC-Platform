@@ -51,6 +51,7 @@ set (    SRCS
          jbsocket.cpp 
          jbuff.cpp 
          jcomp.cpp 
+         crc32.S
          jcrc.cpp 
          jdebug.cpp 
          jencrypt.cpp 
@@ -101,6 +102,8 @@ set (    INCLUDES
         jbuff.hpp
         jcomp.hpp
         jcomp.ipp
+	ppc-opcode.h
+	crc32_constants.h
         jcrc.hpp
         jdebug.hpp
         jelogtype.hpp
@@ -174,6 +177,7 @@ if (CMAKE_COMPILER_IS_GNUCC)
         set_property (SOURCE jencrypt.cpp APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-array-bounds")   # Compiler erroneously reports array bounds errors in some cases
     endif ()
 endif ()
+enable_language(ASM)
 
 include_directories ( 
          ../../system/win32 
