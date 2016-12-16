@@ -26,6 +26,7 @@
 #include "tbb/task_scheduler_init.h"
 #endif
 #include <utility>
+#include <htmxlintrin.h>
 
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -1459,6 +1460,7 @@ public:
 
     inline char * allocateSingle(unsigned allocated, bool incCounter) __attribute__((always_inline));
     char * allocateChunk();
+    char * allocateChunk_nonTM();
     unsigned allocateMultiChunk(unsigned max, char * * rows);   // allocates at least 1 row
     virtual void verifySpaceList();
 
@@ -1492,6 +1494,40 @@ protected:
         char *ptr = (char *) _ptr;
         std::atomic_uint * count = (std::atomic_uint *)(ptr - sizeof(std::atomic_uint));
         count->fetch_add(1, std::memory_order_relaxed);
+    }
+
+    inline void inlineReleasePointerTM(char * ptr)
+    {
+               unsigned r_ptr = makeRelative(ptr);
+               bool break1 = true;
+               while (break1)
+               {
+                   //To prevent the ABA problem the top part of r_blocks stores an incrementing tag
+                   //which is incremented whenever something is added to the free list
+                   unsigned old_blocks = r_blocks.load(std::memory_order_relaxed);
+                   * (unsigned *) ptr = (old_blocks & RBLOCKS_OFFSET_MASK);
+                   unsigned new_tag = ((old_blocks & RBLOCKS_CAS_TAG_MASK) + RBLOCKS_CAS_TAG);
+                   unsigned new_blocks = new_tag | r_ptr;
+                   //if (atomic_cas(&r_blocks, new_blocks, old_blocks))
+                   if (r_blocks.load(std::memory_order_relaxed) == old_blocks)
+                   {
+                      r_blocks.store(new_blocks, std::memory_order_relaxed);
+                       //If this is the first block being added to the free chain then add it to the space list
+                       //It is impossible to make it more restrictive -e.g., only when freeing and full because of
+                       //various race conditions.
+                       if (nextSpace.load(std::memory_order_relaxed) == 0)
+                           addToSpaceList();
+                       break1 = false;
+                   }
+               }
+       
+               CHeap * savedHeap = heap;
+               // after the following dec it is possible that the page could be freed, so cannot access any members of this
+               //compiler_memory_barrier();
+               unsigned tempCount = count.load(std::memory_order_relaxed) - 1;
+               count.store(tempCount, std::memory_order_relaxed);
+               if (tempCount == 1)
+                   noteEmptyPage(savedHeap);
     }
 
     inline void inlineReleasePointer(char * ptr)
@@ -1568,6 +1604,63 @@ public:
     }
 
     virtual void noteReleased(const void *_ptr)
+    {
+    int num_retries = 10;
+    TM_buff_type TM_buff;
+
+    while (1)
+      {
+        if (__TM_begin (TM_buff) == _HTM_TBEGIN_STARTED)
+        {
+           /* transaction state initiated */
+           dbgassertex(_ptr != this);
+           checkPtr(_ptr, "Release");
+   
+           char *ptr = (char *) _ptr - chunkHeaderSize;
+           ChunkHeader * header = (ChunkHeader *)ptr;
+           //If count == 1 then no other thread can be releasing at the same time - so avoid locked operation
+           //Subtract 1 here to try and minimize the conditional branches/simplify the fast path
+           unsigned rowCount = header->count.load(std::memory_order_relaxed)-1;
+   
+           //Check if this is the last release of this row.
+           //It is coded this way to avoid re-evaluating ROWCOUNT() == 0. You could code it using a goto, but it generates worse code.
+           if ((ROWCOUNT(rowCount) == 0) ?
+                   //If the count is zero then use comma expression to set the count for the record to zero as a
+                   //side-effect of this condition.  Could be avoided if leak checking and checkHeap worked differently.
+                   (header->count.store( rowCount, std::memory_order_relaxed), true) :
+                   //otherwise atomically decrement the count, and check if this thread was the last one to release
+                   //Note: the assignment to rowCount allows the compiler to reuse a register, improving the code slightly
+                (header->count.store( (header->count.load( std::memory_order_relaxed) - 1), std::memory_order_relaxed ),
+                     ROWCOUNT( rowCount = header->count.load(std::memory_order_relaxed)) == 0))
+           { 
+                if (rowCount & ROWCOUNT_DESTRUCTOR_FLAG)
+                {
+                     unsigned id = header->allocatorId;
+                     allocatorCache->onDestroy(id & MAX_ACTIVITY_ID, ptr + chunkHeaderSize);
+                }
+   
+#ifdef _CLEAR_FREED_ROW
+               memset((void *)_ptr, 0xdd, chunkCapacity);
+#endif
+               inlineReleasePointerTM(ptr);
+           }
+       //  End of TM piece
+         __TM_end ();
+         return; 
+    }
+    else
+    {
+    	/* Transaction State Failed.  Let's use locks instead. */   
+        if (num_retries-- <= 0 || __TM_is_failure_persistent (TM_buff))
+            {
+		  return noteReleased_nonTM(_ptr);
+            }
+     }
+  }
+
+    }
+
+    virtual void noteReleased_nonTM(const void *_ptr)
     {
         dbgassertex(_ptr != this);
         checkPtr(_ptr, "Release");
@@ -3096,6 +3189,77 @@ void ChunkedHeaplet::verifySpaceList()
 
 //This function must be called inside a protecting lock on the heap it belongs to, or after precreateFreeChain() has been called.
 char * ChunkedHeaplet::allocateSingle(unsigned allocated, bool incCounter)
+{
+    int num_retries = 10;
+    TM_buff_type TM_buff;
+    char *ret;
+    bool break2 = true;
+
+  while (1)
+  {
+    if (__TM_begin (TM_buff) == _HTM_TBEGIN_STARTED)
+       {
+           /* transaction state initiated */
+
+    //The spin lock for the heap this chunk belongs to must be held when this function is called
+    const size32_t size = chunkSize;
+    while(break2)
+    {
+        unsigned old_blocks = r_blocks.load(std::memory_order_acquire);
+        unsigned r_ret = (old_blocks & RBLOCKS_OFFSET_MASK);
+        if (r_ret)
+        {
+            ret = makeAbsolute(r_ret);
+            //may have been allocated by another thread, but still legal to dereference
+            //the cas will fail if the contents are invalid.
+            unsigned next = *(unsigned *)ret;
+
+            //There is a potential ABA problem if other thread(s) allocate two or more items, and free the first
+            //item in the window before the following cas.  r_block would match, but next would be invalid.
+            //To avoid that a tag is stored in the top bits of r_blocks which is modified whenever an item is added
+            //onto the free list.  The offsets in the freelist do not need tags.
+            unsigned new_blocks = (old_blocks & RBLOCKS_CAS_TAG_MASK) | next;
+            //if (atomic_cas(&r_blocks, new_blocks, old_blocks))
+            if (r_blocks.load(std::memory_order_relaxed) == old_blocks)
+              {
+                r_blocks.store(new_blocks, std::memory_order_relaxed);
+                break2=false;
+              }
+        }
+        else
+        {
+            unsigned curFreeBase =  freeBase.load(std::memory_order_relaxed);
+            //There is no ABA issue on freeBase because it is never decremented (and no next chain with it)
+            size32_t bytesFree = dataAreaSize() - curFreeBase;
+            if (bytesFree < size)
+                return NULL;
+
+            //This is the only place that modifies freeBase, so it can be unconditional since caller must have a lock.
+            freeBase.store( curFreeBase + size, std::memory_order_relaxed);
+            ret = data() + curFreeBase;
+            break2=false;
+        }
+    }
+
+    count.store( count.load(std::memory_order_relaxed)+1, std::memory_order_relaxed);
+
+    //  End of TM piece
+      __TM_end ();
+      return ret;
+    }
+    else
+    {
+    	/* Transaction State Failed.  Let's use locks instead. */   
+        if (num_retries-- <= 0 || __TM_is_failure_persistent (TM_buff))
+            {
+		  return allocateChunk_nonTM();
+            }
+     }
+  }
+}
+
+//This function must be called inside a protecting lock on the heap it belongs to, or after precreateFreeChain() has been called.
+char * ChunkedHeaplet::allocateChunk_nonTM()
 {
     //The spin lock for the heap this chunk belongs to must be held when this function is called
     char *ret;
