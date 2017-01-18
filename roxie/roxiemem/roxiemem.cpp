@@ -1460,7 +1460,7 @@ public:
 
     inline char * allocateSingle(unsigned allocated, bool incCounter) __attribute__((always_inline));
     char * allocateChunk();
-    char * allocateChunk_nonTM();
+    char * allocateSingle_nonTM(unsigned allocated, bool incCounter) __attribute__((always_inline));
     unsigned allocateMultiChunk(unsigned max, char * * rows);   // allocates at least 1 row
     virtual void verifySpaceList();
 
@@ -3252,14 +3252,14 @@ char * ChunkedHeaplet::allocateSingle(unsigned allocated, bool incCounter)
     	/* Transaction State Failed.  Let's use locks instead. */   
         if (num_retries-- <= 0 || __TM_is_failure_persistent (TM_buff))
             {
-		  return allocateChunk_nonTM();
+		  return allocateSingle_nonTM(0, true);
             }
      }
   }
 }
 
 //This function must be called inside a protecting lock on the heap it belongs to, or after precreateFreeChain() has been called.
-char * ChunkedHeaplet::allocateChunk_nonTM()
+char * ChunkedHeaplet::allocateSingle_nonTM(unsigned allocated, bool incCounter)
 {
     //The spin lock for the heap this chunk belongs to must be held when this function is called
     char *ret;
@@ -3268,6 +3268,8 @@ char * ChunkedHeaplet::allocateChunk_nonTM()
     if (heapFlags & RHFnofragment)
     {
         unsigned numAllocs = count.load(std::memory_order_acquire)+allocated-1;
+        CChunkedHeap * chunkHeap = static_cast<CChunkedHeap *>(heap);
+        unsigned maxAllocs = chunkHeap->maxChunksPerPage();
         unsigned curFreeBase = freeBase.load(std::memory_order_relaxed);
 
         //If more than half full allocate an entry from the expanding free area
@@ -3283,8 +3285,6 @@ char * ChunkedHeaplet::allocateChunk_nonTM()
                 goto done;
             }
 
-            CChunkedHeap * chunkHeap = static_cast<CChunkedHeap *>(heap);
-            unsigned maxAllocs = chunkHeap->maxChunksPerPage();
             if (numAllocs == maxAllocs)
                 return nullptr;
         }
