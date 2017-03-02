@@ -39,7 +39,11 @@
 // NB: max ROXIEMM_* error is ROXIEMM_ERROR_END (see errorlist.h)
 
 #ifdef __64BIT__
+#ifdef _ARCH_PPC64EL_
+#define HEAP_ALIGNMENT_SIZE I64C(0x80000u)                      // 512kb heaplets
+#else
 #define HEAP_ALIGNMENT_SIZE I64C(0x40000u)                      // 256kb heaplets
+#endif
 #else
 #define HEAP_ALIGNMENT_SIZE 0x40000                             // 256kb heaplets
 #endif
